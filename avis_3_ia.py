@@ -34,8 +34,9 @@ MODEL_GEMINI  = "gemini-3.6-flash"
 MODEL_GROQ    = "openai/gpt-oss-120b"
 MODEL_MISTRAL = "mistral-small-latest"
 
-MAX_TOKENS      = 900
-MAX_TOKENS_SYN  = 1100
+MAX_TOKENS       = 900
+MAX_TOKENS_GEMINI = 4096  # le "thinking" de Gemini 3.x peut consommer une grande partie du budget de façon imprévisible
+MAX_TOKENS_SYN   = 1100
 CONTEXTE_MAX    = 6000   # chars max du contenu texte des fichiers injecté
 
 # ─── Consigne commune de format (JSON structuré) ───────────────────────────
@@ -164,26 +165,54 @@ def parser_json_reponse(texte: str) -> dict:
             return json.loads(match.group(0))
         except Exception:
             pass
-    # Échec : on renvoie le texte brut comme avis, sans note ni listes
+    # Dernier recours : tente de récupérer les champs individuellement,
+    # même si le JSON est incomplet (ex. réponse tronquée par la limite de tokens)
+    avis_m = re.search(r'"avis"\s*:\s*"((?:[^"\\]|\\.)*)"', nettoye)
+    if not avis_m:
+        # Le champ "avis" est peut-être tronqué avant même sa guillemet fermante
+        avis_m = re.search(r'"avis"\s*:\s*"((?:[^"\\]|\\.)*)$', nettoye)
+    note_m = re.search(r'"note"\s*:\s*(\d+)', nettoye)
+    avantages_m = re.findall(r'"avantages"\s*:\s*\[(.*?)\]', nettoye, re.DOTALL)
+    inconv_m = re.findall(r'"inconvenients"\s*:\s*\[(.*?)\]', nettoye, re.DOTALL)
+
+    def _extraire_liste(bloc):
+        if not bloc:
+            return []
+        return [x.strip() for x in re.findall(r'"((?:[^"\\]|\\.)*)"', bloc[0])]
+
+    if avis_m or note_m:
+        return {
+            "avis": (avis_m.group(1).replace('\\"', '"') if avis_m else texte.strip()),
+            "note": int(note_m.group(1)) if note_m else None,
+            "avantages": _extraire_liste(avantages_m),
+            "inconvenients": _extraire_liste(inconv_m),
+        }
+
+    # Échec total : on renvoie le texte brut comme avis, sans note ni listes
     return {"avis": texte.strip(), "note": None, "avantages": [], "inconvenients": []}
 
 
 # ─── Appels API ──────────────────────────────────────────────────────────────
-def appel_gemini(question_complete, fichiers_gemini, api_key, system_prompt=PROMPT_GEMINI, max_tok=MAX_TOKENS):
+def appel_gemini(question_complete, fichiers_gemini, api_key, system_prompt=PROMPT_GEMINI, max_tok=MAX_TOKENS_GEMINI):
     url = GEMINI_URL.format(model=MODEL_GEMINI)
     parts = [{"text": system_prompt + "\n\n--- DEMANDE ---\n" + question_complete}]
     for mime, b64 in fichiers_gemini:
         parts.append({"inline_data": {"mime_type": mime, "data": b64}})
     payload = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"maxOutputTokens": max_tok, "temperature": 0.7},
+        "generationConfig": {
+            "maxOutputTokens": max_tok,
+            "temperature": 0.7,
+            "thinkingConfig": {"thinkingLevel": "low"},  # limite la réflexion interne pour laisser de la place à la réponse
+        },
     }
     # Clé transmise en en-tête plutôt qu'en paramètre d'URL : elle n'apparaît
     # ainsi jamais dans une éventuelle URL affichée dans un message d'erreur.
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
 
     derniere_erreur = None
-    for tentative in range(2):  # 1 essai + 1 nouvelle tentative si 503 (surcharge Gemini)
+    for tentative, budget in enumerate([max_tok, max_tok * 2]):  # 2e essai avec budget doublé si troncature
+        payload["generationConfig"]["maxOutputTokens"] = budget
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=90)
             if r.status_code == 503 and tentative == 0:
@@ -191,12 +220,19 @@ def appel_gemini(question_complete, fichiers_gemini, api_key, system_prompt=PROM
                 continue
             r.raise_for_status()
             data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            candidat = data["candidates"][0]
+            texte = candidat["content"]["parts"][0]["text"] if candidat.get("content", {}).get("parts") else ""
+            # Si la réponse a été coupée par le budget de tokens (réflexion interne trop gourmande)
+            # et qu'il reste une tentative, on relance avec plus de marge plutôt que de renvoyer un texte tronqué.
+            if candidat.get("finishReason") == "MAX_TOKENS" and tentative == 0:
+                derniere_erreur = "Réponse tronquée (réflexion interne trop longue)"
+                continue
+            return texte
         except requests.exceptions.HTTPError:
             raise RuntimeError(f"Gemini a répondu avec le code {r.status_code} (service indisponible ou clé invalide). Réessaie dans quelques instants.")
         except requests.exceptions.RequestException:
             raise RuntimeError("Impossible de joindre le service Gemini (connexion). Réessaie dans quelques instants.")
-    raise RuntimeError(f"{derniere_erreur} — réessaie dans quelques instants.")
+    raise RuntimeError(f"{derniere_erreur} — réessaie, ou reformule la demande plus simplement.")
 
 
 def appel_groq(question_complete, api_key, system_prompt=PROMPT_GROQ, max_tok=MAX_TOKENS):
