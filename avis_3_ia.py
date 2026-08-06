@@ -178,10 +178,25 @@ def appel_gemini(question_complete, fichiers_gemini, api_key, system_prompt=PROM
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"maxOutputTokens": max_tok, "temperature": 0.7},
     }
-    r = requests.post(url, params={"key": api_key}, json=payload, timeout=90)
-    r.raise_for_status()
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    # Clé transmise en en-tête plutôt qu'en paramètre d'URL : elle n'apparaît
+    # ainsi jamais dans une éventuelle URL affichée dans un message d'erreur.
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+    derniere_erreur = None
+    for tentative in range(2):  # 1 essai + 1 nouvelle tentative si 503 (surcharge Gemini)
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
+            if r.status_code == 503 and tentative == 0:
+                derniere_erreur = "Service Gemini temporairement surchargé"
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except requests.exceptions.HTTPError:
+            raise RuntimeError(f"Gemini a répondu avec le code {r.status_code} (service indisponible ou clé invalide). Réessaie dans quelques instants.")
+        except requests.exceptions.RequestException:
+            raise RuntimeError("Impossible de joindre le service Gemini (connexion). Réessaie dans quelques instants.")
+    raise RuntimeError(f"{derniere_erreur} — réessaie dans quelques instants.")
 
 
 def appel_groq(question_complete, api_key, system_prompt=PROMPT_GROQ, max_tok=MAX_TOKENS):
